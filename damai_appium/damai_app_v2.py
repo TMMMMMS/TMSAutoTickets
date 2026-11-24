@@ -26,6 +26,16 @@ else:
     from damai_appium.page import Page, PurchaseStopped, label, matches_session, unique
 
 
+VERIFICATION_ACTIVITY = "com.alibaba.wireless.security.open.middletier.fc.ui.ContainerActivity"
+PAGE_TIMEOUT = 8
+POLL_INTERVAL = 0.35
+
+
+def check_stock(page):
+    if page.named("库存不足", "余票不足", "所选票档已售罄"):
+        raise NoStock("本次目标余票不足")
+
+
 def compact(value):
     return "".join(value.split())
 
@@ -133,15 +143,22 @@ class DamaiBot:
             validate_sale_label(page.texts("id_project_count_sell_time"), self.config.sale_at)
         return unique(page.ids("trade_project_detail_purchase_status_bar_container_fl"), "购票入口")
 
-    def active_page(self):
+    def active_page(self, on_verification=None):
         while True:
             self.check_deadline()
             page = Page(self.driver)
             if not self.window:
                 return page
             texts = [label(n) for n in page.nodes]
-            if any(t in ("请完成验证", "安全验证", "滑动验证", "登录大麦") for t in texts):
+            if "登录大麦" in texts:
                 raise PurchaseStopped("页面要求人工验证或登录，请接手")
+            verification = any(t in ("请完成验证", "安全验证", "滑动验证") for t in texts)
+            if verification or (on_verification and self.driver.current_activity == VERIFICATION_ACTIVITY):
+                if on_verification is None:
+                    raise PurchaseStopped("页面要求人工验证或登录，请接手")
+                on_verification()
+                self.window.pause(POLL_INTERVAL)
+                continue
             if not any(t.startswith(("正在排队", "排队中", "您正在排队")) for t in texts):
                 return page
             self.window.pause(1)
@@ -149,13 +166,13 @@ class DamaiBot:
     def until(self, predicate, description):
         def ready(_):
             page = self.active_page()
-            if self.window and page.named("库存不足", "余票不足", "所选票档已售罄"):
-                raise NoStock("本次目标余票不足")
+            if self.window:
+                check_stock(page)
             if predicate(page):
                 return page
             return False
         try:
-            return WebDriverWait(self.driver, 8, poll_frequency=0.35).until(ready)
+            return WebDriverWait(self.driver, PAGE_TIMEOUT, poll_frequency=POLL_INTERVAL).until(ready)
         except TimeoutException as exc:
             raise PurchaseStopped(f"未确认{description}") from exc
 
@@ -213,11 +230,39 @@ class DamaiBot:
             self.window.pause(0.5)
         raise PurchaseStopped("无法返回目标详情页")
 
+    def wait_for_session_list(self, date_id):
+        if not self.window:
+            return self.until(lambda page: page.ids(date_id), "场次列表")
+
+        load_deadline = time.monotonic() + PAGE_TIMEOUT
+        prompted = False
+
+        def on_verification():
+            nonlocal load_deadline, prompted
+            load_deadline = None
+            if not prompted:
+                print("请在手机上完成验证，正在等待目标场次列表。按 Ctrl+C 可取消。", flush=True)
+                prompted = True
+
+        while True:
+            page = self.active_page(on_verification=on_verification)
+            self.check_deadline()
+            check_stock(page)
+            if page.ids(date_id):
+                return page
+            now = time.monotonic()
+            if load_deadline is None:
+                load_deadline = now + PAGE_TIMEOUT
+            remaining = load_deadline - now
+            if remaining <= 0:
+                raise PurchaseStopped("未确认场次列表")
+            self.window.pause(min(POLL_INTERVAL, remaining))
+
     def select_tickets(self):
         cfg = self.config
         date_id = "project_detail_perform_flowlayout"
         price_id = "project_detail_perform_price_flowlayout"
-        page = self.until(lambda p: p.ids(date_id), "场次列表")
+        page = self.wait_for_session_list(date_id)
         if title_key(cfg.keyword) not in {title_key(text) for text in page.texts("tv_title")}:
             raise PurchaseStopped("选票页演出不符")
         row = pick(option_texts(page, date_id, (cfg.date, cfg.session_time)),

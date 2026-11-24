@@ -267,3 +267,145 @@ def test_retained_ticket_count(cfg, clock, monkeypatch, initial, target, adjustm
     bot.select_tickets()
     assert actions == ["session", "tier", *adjustments, "btn_buy_view"]
     assert count == target
+
+
+@pytest.fixture
+def session_transition(cfg, clock, monkeypatch):
+    from unittest.mock import PropertyMock
+    from xml.etree.ElementTree import SubElement, tostring
+    from selenium.webdriver.support import wait
+
+    bot = flow.DamaiBot(cfg, Mock())
+    bot.window.wait_for_open(lambda: None)
+    start = clock.monotonic
+    activity = "com.alibaba.wireless.security.open.middletier.fc.ui.ContainerActivity"
+    clicks = []
+    transition = SimpleNamespace(after_click=lambda elapsed: "target", clicks=clicks, bot=bot)
+
+    def screen():
+        return transition.after_click(clock.monotonic - start) if clicks else "detail"
+
+    def source():
+        root = Element("hierarchy")
+
+        def node(rid, text="", parent=root):
+            return SubElement(parent, "node", {"package": "cn.damai", "text": text,
+                              "resource-id": "cn.damai:id/" + rid, "bounds": "[0,0][1,1]"})
+
+        state = screen()
+        if state == "detail":
+            node("info_v2_title_tv1", cfg.keyword)
+            node("venue_name_0", cfg.city)
+            node("trade_project_detail_purchase_status_bar_container_fl", "立即购买")
+        elif state in ("target", "wrong_title"):
+            node("tv_title", cfg.keyword if state == "target" else "其他演出")
+            node("session", cfg.date + " " + cfg.session_time, node("project_detail_perform_flowlayout"))
+            node("tier", cfg.price, node("project_detail_perform_price_flowlayout"))
+            node("tv_price", str(flow.amount(cfg.price)))
+            node("btn_buy_view")
+        elif state == "text_verification":
+            node("message", "安全验证")
+        elif state == "login":
+            node("message", "登录大麦")
+        return tostring(root)
+
+    def click(page, node, before_click):
+        before_click()
+        clicks.append((node.get("resource-id").split("/")[-1], clock.monotonic - start))
+
+    driver_type = type(bot.driver)
+    driver_type.page_source = PropertyMock(side_effect=source)
+    driver_type.current_activity = PropertyMock(side_effect=lambda: activity if screen() == "verification" else "")
+    driver_type.current_package = PropertyMock(side_effect=lambda: "other.app" if screen() == "other_app" else "cn.damai")
+    monkeypatch.setattr(flow.Page, "click", click)
+    monkeypatch.setattr(flow, "time", schedule.time)
+    monkeypatch.setattr(wait, "time", schedule.time)
+    cfg.users = ["甲"]
+    return transition
+
+
+def test_manual_verification_then_detail_then_session_list(session_transition, capsys):
+    transition = session_transition
+
+    def timeline(elapsed):
+        if elapsed < 2:
+            return "detail"
+        if elapsed < 12:
+            return "verification"
+        if elapsed < 13:
+            return "detail"
+        return "target"
+
+    transition.after_click = timeline
+    transition.bot.open_sale()
+    transition.bot.select_tickets()
+    assert [name for name, _ in transition.clicks] == [
+        "trade_project_detail_purchase_status_bar_container_fl", "session", "tier", "btn_buy_view"]
+    assert transition.clicks[1][1] >= 13
+    assert capsys.readouterr().out.count("请在手机上完成验证") == 1
+    transition.bot.driver.back.assert_not_called()
+
+
+@pytest.mark.parametrize("state,reason", [
+    ("unknown", "未确认场次列表"),
+    ("wrong_title", "选票页演出不符"),
+    ("login", "登录"),
+    ("other_app", "前台打开大麦"),
+])
+def test_blocked_session_transition(session_transition, clock, state, reason):
+    transition = session_transition
+    transition.after_click = lambda elapsed: state
+    transition.bot.open_sale()
+    start = clock.monotonic
+    with pytest.raises(flow.PurchaseStopped, match=reason):
+        transition.bot.select_tickets()
+    assert clock.monotonic - start == (8 if state == "unknown" else 0)
+    assert transition.clicks == [("trade_project_detail_purchase_status_bar_container_fl", 0)]
+    transition.bot.driver.back.assert_not_called()
+
+
+def test_direct_session_list(session_transition, capsys):
+    transition = session_transition
+    transition.bot.open_sale()
+    transition.bot.select_tickets()
+    assert [name for name, _ in transition.clicks] == [
+        "trade_project_detail_purchase_status_bar_container_fl", "session", "tier", "btn_buy_view"]
+    assert "请在手机上完成验证" not in capsys.readouterr().out
+
+
+def test_session_transition_expires(session_transition, clock, capsys):
+    transition = session_transition
+    transition.after_click = lambda elapsed: "text_verification"
+    clock.wall = transition.bot.window.end - 2
+    transition.bot.open_sale()
+    with pytest.raises(schedule.WindowExpired, match="时间已到"):
+        transition.bot.select_tickets()
+    assert clock.wall == transition.bot.window.end
+    assert transition.clicks == [("trade_project_detail_purchase_status_bar_container_fl", 0)]
+    assert capsys.readouterr().out.count("请在手机上完成验证") == 1
+    transition.bot.driver.back.assert_not_called()
+
+
+def test_cancel_session_transition(session_transition, monkeypatch, capsys):
+    transition = session_transition
+    transition.after_click = lambda elapsed: "text_verification"
+    transition.bot.open_sale()
+    monkeypatch.setattr(schedule.time, "sleep", Mock(side_effect=KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        transition.bot.select_tickets()
+    assert transition.clicks == [("trade_project_detail_purchase_status_bar_container_fl", 0)]
+    assert capsys.readouterr().out.count("请在手机上完成验证") == 1
+    transition.bot.driver.back.assert_not_called()
+
+
+def test_unknown_page_after_verification_times_out(session_transition, clock, capsys):
+    transition = session_transition
+    transition.after_click = lambda elapsed: "verification" if elapsed < 10 else "detail"
+    start = clock.monotonic
+    transition.bot.open_sale()
+    with pytest.raises(flow.PurchaseStopped, match="未确认场次列表"):
+        transition.bot.select_tickets()
+    assert 18 <= clock.monotonic - start < 18.35
+    assert transition.clicks == [("trade_project_detail_purchase_status_bar_container_fl", 0)]
+    assert capsys.readouterr().out.count("请在手机上完成验证") == 1
+    transition.bot.driver.back.assert_not_called()
