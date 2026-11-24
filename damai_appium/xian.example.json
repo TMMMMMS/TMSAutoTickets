@@ -1,0 +1,15 @@
+{
+  "server_url": "http://127.0.0.1:4723",
+  "keyword": "济南·徐良“时间折叠”巡回演唱会-济南站",
+  "city": "济南",
+  "date": "2026-12-05",
+  "session_time": "19:00",
+  "price": "看台680元",
+  "users": [
+    "尚洁"
+  ],
+  "ticket_count": 1,
+  "if_commit_order": true,
+  "sale_at": "2026-11-24 15:30:00",
+  "retry_minutes": 6
+}
